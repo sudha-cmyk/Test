@@ -1,0 +1,19 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+.Python
+
+# Local secrets (copy from local_settings.example.py)
+local_settings.py
+
+# IDE
+.idea/
+.vscode/
+
+# Debug screenshots from failed Selenium runs
+login_error.png
