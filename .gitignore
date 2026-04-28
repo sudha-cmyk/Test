@@ -17,3 +17,7 @@ local_settings.py
 
 # Debug screenshots from failed Selenium runs
 login_error.png
+login_failed.png
+add_candidate_error.png
+simple_login_error.png
+bulk_*.png

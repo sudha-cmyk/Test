@@ -1,380 +1,486 @@
 """
-Log in to Recruiterflow, open Add candidate, and fill the candidate form.
+Selenium automation: log in, open Add Candidate, fill core fields, save, verify, quit.
 
-Run (with the app up and venv active):
+Credentials: LOGIN_URL, EMAIL, PASSWORD in local_settings.py
 
+Each run builds **unique** candidate data (uuid / random / timestamp):
+  - Email: testuser_<timestamp>@mail.com (timestamp from time.time_ns())
+  - Phone: random 10-digit US-style number
+  - Names: optional seeds CANDIDATE_FIRST_NAME / CANDIDATE_LAST_NAME; each run appends a
+    unique suffix. Set ADD_CANDIDATE_USE_RANDOM_NAME_POOL = True for random pool names + suffix.
+
+Run:
     python add_candidate_automation.py
 
-Uses the same login settings as login_recruiterflow.py (local_settings.py).
-Candidate field values also live in local_settings.py.
-
-The UI often hides "Add candidate" inside a menu, so this script first tries to
-click a visible link to /prospect/add (or /candidates/add). If none is found, it
-opens /prospect/add directly (same page the menu item goes to).
+Uses WebDriverWait for synchronization; adds a 1–2 s pause after major clicks/inputs
+so the UI can settle (see pause_after_major_action).
 """
 
+from __future__ import annotations
+
+import random
 import sys
 import time
+import uuid
+from dataclasses import dataclass
 
-from selenium.common.exceptions import TimeoutException
+from selenium import webdriver
+from selenium.common.exceptions import (
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from login_recruiterflow import (
-    WAIT_SECONDS,
-    LoginFailedError,
-    build_driver,
-    get_base_url,
-    perform_login,
-)
-
-# New-table users land on /candidates; the add form can take a while to load and the
-# splash loader (#rf-initial-page-loader) must disappear before inputs exist in the DOM.
-ADD_FORM_WAIT = 60
-ROOT_READY_WAIT = 90
-
 try:
-    from local_settings import (
-        CANDIDATE_EDUCATION_DEGREE,
-        CANDIDATE_EDUCATION_SCHOOL,
-        CANDIDATE_EMAIL,
-        CANDIDATE_EXPERIENCE_COMPANY,
-        CANDIDATE_EXPERIENCE_TITLE,
-        CANDIDATE_FIRST_NAME,
-        CANDIDATE_LAST_NAME,
-        CANDIDATE_LOCATION,
-        CANDIDATE_PHONE,
-    )
+    import local_settings as _local
 except ImportError as e:
     raise SystemExit(
-        "Missing candidate fields in local_settings.py. "
-        "Copy them from local_settings.example.py into local_settings.py. "
-        f"Original error: {e}"
+        "Create local_settings.py (copy from local_settings.example.py) with "
+        f"LOGIN_URL, EMAIL, PASSWORD. ({e})"
     ) from e
 
-# --- Add candidate form: XPath locators (Recruiterflow prospect / add-candidate form) ---
-# Each line is the XPath string; below we wrap them as (By.XPATH, ...) for Selenium.
-FIRST_NAME_XPATH = "//input[@id='rf-application-form-first-name']"
-# Same field via its wrapper (useful if id changes): //div[contains(@class,'email-input-wrapper')]//input[contains(@class,'full-first-name-input')]
-#//*[@id="main-content-wrapper-id"]/div/div[1]/div/div/div[1]/div/div[1]/ul/li[1]/div/div[1]/input
-LAST_NAME_XPATH = "//input[@id='rf-application-form-last-name']"
-# Wrapper variant: //div[contains(@class,'password-login-container')]//input[@id='rf-application-form-last-name']
+try:
+    LOGIN_URL = _local.LOGIN_URL
+    EMAIL = _local.EMAIL
+    PASSWORD = _local.PASSWORD
+except AttributeError as e:
+    raise SystemExit("local_settings.py must define LOGIN_URL, EMAIL, and PASSWORD.") from e
 
-EMAIL_XPATH = "//input[@id='rf-application-form-email']"
+# Optional name seeds (each run still gets a unique suffix).
+_NAME_SEED_FIRST = getattr(_local, "CANDIDATE_FIRST_NAME", "Test")
+_NAME_SEED_LAST = getattr(_local, "CANDIDATE_LAST_NAME", "User")
 
-# First tel input named user-phone (intl-tel); index [1] if the page has several.
-PHONE_XPATH_FIRST = "(//input[@name='user-phone' and @type='tel'])[1]"
-
-LOCATION_XPATH = (
-    "//input[contains(@class,'location-search-input')]"
-    "[not(contains(@style,'display: none'))]"
+# Built-in pools when using random name parts (still unique per run via suffix).
+_FIRST_NAME_POOL = (
+    "Alex",
+    "Jordan",
+    "Taylor",
+    "Riley",
+    "Casey",
+    "Morgan",
+    "Quinn",
+    "Avery",
+    "Jamie",
+    "Reese",
 )
-# Parent wrapper: //div[contains(@class,'location-input-wrapper')]//input[contains(@class,'location-search-input')]
-
-EXPERIENCE_COMPANY_XPATH = "//input[@id='rf-application-form-company']"
-EXPERIENCE_TITLE_XPATH = "//input[@id='rf-application-form-title']"
-# Experience block: //div[contains(@class,'experience-input-wrapper')]//input[@id='rf-application-form-company']
-
-EDUCATION_SCHOOL_XPATH = "//input[@id='rf-application-form-school']"
-EDUCATION_DEGREE_XPATH = "//input[@id='rf-application-form-degree']"
-# Education block: //div[contains(@class,'education-input-wrapper')]//input[@id='rf-application-form-school']
-
-# Locator tuples used by WebDriverWait / find_element
-FIRST_NAME = (By.XPATH, FIRST_NAME_XPATH)
-LAST_NAME = (By.XPATH, LAST_NAME_XPATH)
-EMAIL = (By.XPATH, EMAIL_XPATH)
-PHONE = (By.XPATH, PHONE_XPATH_FIRST)
-LOCATION = (By.XPATH, LOCATION_XPATH)
-EXPERIENCE_COMPANY = (By.XPATH, EXPERIENCE_COMPANY_XPATH)
-EXPERIENCE_TITLE = (By.XPATH, EXPERIENCE_TITLE_XPATH)
-EDUCATION_SCHOOL = (By.XPATH, EDUCATION_SCHOOL_XPATH)
-EDUCATION_DEGREE = (By.XPATH, EDUCATION_DEGREE_XPATH)
+_LAST_NAME_POOL = (
+    "Smith",
+    "Jones",
+    "Brown",
+    "Davis",
+    "Miller",
+    "Wilson",
+    "Moore",
+    "Taylor",
+    "Anderson",
+    "Thomas",
+)
 
 
-def _select_all_key():
-    """Cmd+A on macOS, Ctrl+A elsewhere (matches browser select-all)."""
-    return Keys.COMMAND if sys.platform == "darwin" else Keys.CONTROL
+@dataclass(frozen=True)
+class CandidateTestData:
+    """One-off candidate row for a single automation run."""
+
+    first_name: str
+    last_name: str
+    email: str
+    phone: str
 
 
-def scroll_and_focus(driver, element):
-    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-    time.sleep(0.15)
-    try:
-        element.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", element)
-    time.sleep(0.1)
+def _random_us_phone_digits() -> str:
+    """10-digit NANP-style number (not guaranteed valid NPA/NXX; fine for test forms)."""
+    area = random.randint(200, 999)
+    prefix = random.randint(200, 999)
+    line = random.randint(0, 9999)
+    return f"{area}{prefix}{line:04d}"
 
 
-def react_fill_text_input(driver, element, text):
+def generate_unique_candidate_data(
+    *,
+    use_random_name_from_pool: bool = False,
+) -> CandidateTestData:
     """
-    Fill a React-controlled <input> so the UI state updates (clear/send_keys alone often fails).
-    Uses the native value setter + input/change events.
+    Build unique first/last/email/phone for this run.
+
+    Email pattern: ``testuser_<timestamp>@mail.com`` using ``time.time_ns()`` so each
+    run is unique even under fast consecutive executions.
+
+    Names: either ``<seed>_<suffix>`` or ``<random_pool_name>_<suffix>``.
     """
-    scroll_and_focus(driver, element)
-    driver.execute_script(
-        """
-        const el = arguments[0];
-        const val = arguments[1];
-        const proto = el instanceof HTMLTextAreaElement
-            ? window.HTMLTextAreaElement.prototype
-            : window.HTMLInputElement.prototype;
-        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-        if (desc && desc.set) {
-            desc.set.call(el, val);
-        } else {
-            el.value = val;
-        }
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        """,
-        element,
-        str(text),
-    )
+    suffix = uuid.uuid4().hex[:10]
+    email = f"testuser_{time.time_ns()}@mail.com"
 
-
-def fill_phone_field(driver, element, phone):
-    """Phone uses intl-tel-input when present; otherwise same as React input."""
-    scroll_and_focus(driver, element)
-    raw = str(phone).strip()
-    if raw.startswith("+"):
-        e164 = raw
-    elif len(raw) == 10 and raw.isdigit():
-        e164 = "+1" + raw
+    if use_random_name_from_pool:
+        first = f"{random.choice(_FIRST_NAME_POOL)}_{suffix[:8]}"
+        last = f"{random.choice(_LAST_NAME_POOL)}_{suffix[:8]}"
     else:
-        e164 = "+" + raw.lstrip("+")
+        first = f"{_NAME_SEED_FIRST}_{suffix[:8]}"
+        last = f"{_NAME_SEED_LAST}_{suffix[:8]}"
 
-    driver.execute_script(
-        """
-        const el = arguments[0];
-        const e164 = arguments[1];
-        el.focus();
-        if (window.intlTelInputGlobals) {
-            const iti = window.intlTelInputGlobals.getInstance(el);
-            if (iti) {
-                iti.setNumber(e164);
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                return;
-            }
-        }
-        const proto = window.HTMLInputElement.prototype;
-        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-        const national = e164.replace(/^\\+1/, '');
-        if (desc && desc.set) desc.set.call(el, national);
-        else el.value = national;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        """,
-        element,
-        e164,
+    phone = _random_us_phone_digits()
+    return CandidateTestData(
+        first_name=first,
+        last_name=last,
+        email=email,
+        phone=phone,
     )
 
+# Reuse login field locators and Chrome driver factory from this project.
+from Login_Page import (
+    EMAIL_XPATHS,
+    PASSWORD_XPATHS,
+    PROCEED_BUTTON,
+    SUBMIT_XPATHS,
+    _first_by_xpath,
+    _first_clickable_xpath,
+    build_driver,
+)
 
-def wait_for_root_app(driver, timeout=ROOT_READY_WAIT):
-    """Wait until React has mounted something under #root."""
-    WebDriverWait(driver, timeout).until(
-        lambda d: d.execute_script(
-            "const r=document.getElementById('root'); return !!(r && r.children && r.children.length);"
-        )
-    )
+# --- Locators provided for the add-candidate flow (absolute XPaths) ---
+XP_ADD_CANDIDATE_BUTTON = '//*[@id="root"]/div/header/ul/li[2]/div[1]/button'
+XP_FIRST_NAME = '//*[@id="main-content-wrapper-id"]/div/div[1]/div/div/div[1]/div/div[1]/ul/li[1]/div/div[1]/input'
+XP_LAST_NAME = '//*[@id="main-content-wrapper-id"]/div/div[1]/div/div/div[1]/div/div[1]/ul/li[1]/div/div[2]/input'
+XP_EMAIL = '//*[@id="main-content-wrapper-id"]/div/div[1]/div/div/div[1]/div/div[1]/ul/li[2]/div/input'
+XP_PHONE = '//*[@id="main-content-wrapper-id"]/div/div[1]/div/div/div[1]/div/div[1]/ul/li[3]/div/div/input'
+XP_CREATE_CANDIDATE = '//*[@id="main-content-wrapper-id"]/div/div[2]/div/button[1]'
 
+DEFAULT_WAIT_SECONDS = 30
+LOGIN_NAV_WAIT = 45
+DASHBOARD_WAIT = 45
+FORM_WAIT = 30
+# Allow time for save API, toast, or client-side navigation after Create.
+POST_CREATE_WAIT = 45
 
-def dismiss_rf_splash_loader(driver):
-    """Hide the full-page loader if it is still covering the app (safe for local automation)."""
-    driver.execute_script(
-        """
-        var el = document.getElementById('rf-initial-page-loader');
-        if (el) { el.style.display = 'none'; el.style.visibility = 'hidden'; }
-        try { window.postMessage('recruiterflow-react-loaded', '*'); } catch (e) {}
-        """
-    )
-
-
-def wait_for_add_form(driver, timeout=ADD_FORM_WAIT):
-    WebDriverWait(driver, timeout).until(EC.presence_of_element_located(FIRST_NAME))
-
-
-def try_click_add_candidate_link(driver):
-    """Click a visible Add-candidate link if one exists (same targets as the header menu)."""
-    for xp in (
-        "//a[contains(@href,'/prospect/add')]",
-        "//a[contains(@href,'/candidates/add')]",
-    ):
-        for el in driver.find_elements(By.XPATH, xp):
-            try:
-                if el.is_displayed() and el.is_enabled():
-                    el.click()
-                    print("Clicked an 'Add candidate' link in the UI.")
-                    return True
-            except Exception:
-                continue
-    return False
-
-
-def try_click_add_candidate_menu_text(driver):
-    """Try visible menu rows / buttons labeled Add candidate (quick-add menu)."""
-    xpaths = (
-        "//a[normalize-space()='Add candidate']",
-        "//span[normalize-space()='Add candidate']/ancestor::a",
-        "//span[normalize-space()='Add candidate']/ancestor::button",
-        "//button[contains(normalize-space(.),'Add candidate')]",
-        "//*[@role='menuitem'][contains(.,'Add candidate')]",
-    )
-    for xp in xpaths:
-        for el in driver.find_elements(By.XPATH, xp):
-            try:
-                if el.is_displayed() and el.is_enabled():
-                    el.click()
-                    print("Clicked an 'Add candidate' control in the page.")
-                    return True
-            except Exception:
-                continue
-    return False
+# Visible regions that often host success copy (Recruiterflow / React / MUI patterns).
+SUCCESS_MESSAGE_CONTAINER_XPATHS = (
+    "//*[@role='alert']",
+    "//div[contains(@class,'Toastify__toast')]",
+    "//div[contains(@class,'toast')]",
+    "//*[contains(@class,'Snackbar')]",
+    "//*[contains(@class,'snackbar')]",
+    "//*[contains(@class,'notification')]",
+    "//*[contains(@class,'MuiAlert')]",
+    "//*[contains(@class,'rf-toast')]",
+)
+SUCCESS_TEXT_KEYWORDS = (
+    "success",
+    "created",
+    "added",
+    "saved",
+    "candidate",
+)
 
 
-def open_add_candidate_form(driver, wait):
-    """Ensure the add-candidate form is open (click link or go to URL)."""
-    wait_for_root_app(driver)
-    time.sleep(1)
-    dismiss_rf_splash_loader(driver)
-
-    if try_click_add_candidate_link(driver):
-        wait_for_root_app(driver, timeout=45)
-        dismiss_rf_splash_loader(driver)
-        wait_for_add_form(driver)
-        return
-
-    base = get_base_url().rstrip("/")
-    # If you already use the new candidates grid, try its add URL first.
-    on_new_table = "/candidates" in (driver.current_url or "")
-    paths = (
-        ("/candidates/add", "/prospect/add") if on_new_table else ("/prospect/add", "/candidates/add")
-    )
-
-    last_err = None
-    for path in paths:
-        url = base + path
-        print(f"Opening add-candidate page: {url}")
-        driver.get(url)
-        wait_for_root_app(driver, timeout=45)
-        time.sleep(1.5)
-        dismiss_rf_splash_loader(driver)
-        try:
-            wait_for_add_form(driver, timeout=ADD_FORM_WAIT)
-            print("Add-candidate form is ready.")
-            return
-        except TimeoutException as e:
-            last_err = e
-            continue
-
-    # Last resort: stay on grid and try to open Add candidate from the UI text / menu.
-    print("Trying Add candidate from visible controls…")
-    driver.get(base + "/candidates")
-    wait_for_root_app(driver, timeout=45)
-    dismiss_rf_splash_loader(driver)
-    time.sleep(1)
-    if try_click_add_candidate_menu_text(driver) or try_click_add_candidate_link(driver):
-        wait_for_root_app(driver, timeout=45)
-        dismiss_rf_splash_loader(driver)
-        try:
-            wait_for_add_form(driver, timeout=ADD_FORM_WAIT)
-            return
-        except TimeoutException as e:
-            last_err = e
-
-    raise TimeoutException(
-        "Could not find the first-name field after opening the add-candidate flow. "
-        f"Expected XPath: {FIRST_NAME_XPATH!r}. "
-        "Update FIRST_NAME_XPATH in add_candidate_automation.py if the DOM changed. "
-        f"Last URL: {driver.current_url!r}"
-    ) from last_err
+def pause_after_major_action() -> None:
+    """Sleep 1–2 seconds after a click, text input, navigation, or leaving the login route."""
+    time.sleep(random.uniform(1.0, 2.0))
 
 
-def fill_location(driver, wait, text):
-    """
-    Location is often a search box with suggestions — real keystrokes work best for the dropdown.
-    """
-    el = wait.until(EC.element_to_be_clickable(LOCATION))
-    scroll_and_focus(driver, el)
-    el.send_keys(_select_all_key(), "a")
-    el.send_keys(Keys.BACKSPACE)
-    el.send_keys(str(text))
-    time.sleep(1.2)
+def build_wait(driver: webdriver.Chrome, seconds: int = DEFAULT_WAIT_SECONDS) -> WebDriverWait:
+    """Standard explicit wait helper."""
+    return WebDriverWait(driver, seconds)
+
+
+# ---------------------------------------------------------------------------
+# Step 1–2: open login page and sign in
+# ---------------------------------------------------------------------------
+def navigate_to_login(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
+    """Launch is implicit in build_driver; navigate to the configured login URL."""
+    driver.get(LOGIN_URL)
+    pause_after_major_action()
+    # Wait for the React login shell when present (non-fatal if the DOM differs slightly).
     try:
-        el.send_keys(Keys.ARROW_DOWN, Keys.ENTER)
-    except Exception:
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#root form")))
+    except TimeoutException:
         pass
 
 
-def fill_candidate_form(driver, wait):
-    """
-    Fill each field using XPath locators above; values come from local_settings.py
-    (CANDIDATE_FIRST_NAME, CANDIDATE_LAST_NAME, …).
-    """
-    fn = wait.until(EC.element_to_be_clickable(FIRST_NAME))
-    react_fill_text_input(driver, fn, CANDIDATE_FIRST_NAME)
-    print("Filled first name.")
-    time.sleep(0.25)
+def perform_login(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
+    """Fill email/password and submit; dismiss optional multi-login modal via explicit wait."""
+    el_email, _ = _first_by_xpath(driver, EMAIL_XPATHS)
+    el_email.clear()
+    el_email.send_keys(EMAIL)
+    pause_after_major_action()
 
-    react_fill_text_input(driver, driver.find_element(*LAST_NAME), CANDIDATE_LAST_NAME)
-    print("Filled last name.")
-    time.sleep(0.25)
+    el_pass, _ = _first_by_xpath(driver, PASSWORD_XPATHS)
+    el_pass.clear()
+    el_pass.send_keys(PASSWORD)
+    pause_after_major_action()
 
-    react_fill_text_input(driver, driver.find_element(*EMAIL), CANDIDATE_EMAIL)
-    print("Filled email.")
-    time.sleep(0.25)
+    el_submit, _ = _first_clickable_xpath(driver, SUBMIT_XPATHS)
+    el_submit.click()
+    pause_after_major_action()
 
-    fill_phone_field(driver, wait.until(EC.element_to_be_clickable(PHONE)), CANDIDATE_PHONE)
-    print("Filled phone.")
-    time.sleep(0.25)
-
-    fill_location(driver, wait, CANDIDATE_LOCATION)
-    print("Filled location.")
-    time.sleep(0.25)
-
-    react_fill_text_input(driver, wait.until(EC.element_to_be_clickable(EXPERIENCE_COMPANY)), CANDIDATE_EXPERIENCE_COMPANY)
-    if CANDIDATE_EXPERIENCE_TITLE:
-        react_fill_text_input(driver, driver.find_element(*EXPERIENCE_TITLE), CANDIDATE_EXPERIENCE_TITLE)
-    print("Filled experience (company / title fields).")
-    time.sleep(0.25)
-
-    react_fill_text_input(driver, wait.until(EC.element_to_be_clickable(EDUCATION_SCHOOL)), CANDIDATE_EDUCATION_SCHOOL)
-    if CANDIDATE_EDUCATION_DEGREE:
-        react_fill_text_input(driver, driver.find_element(*EDUCATION_DEGREE), CANDIDATE_EDUCATION_DEGREE)
-    print("Filled education (school / degree fields).")
-
-
-def main():
-    driver = build_driver()
-    wait = WebDriverWait(driver, WAIT_SECONDS)
-
+    # Optional “Multiple logins” dialog — wait only if it appears.
+    modal_wait = WebDriverWait(driver, 5)
     try:
-        perform_login(driver, wait)
-        open_add_candidate_form(driver, wait)
-        fill_candidate_form(driver, wait)
-        print("Candidate form filled (review in the browser before saving).")
-        input("Press Enter in this terminal to close the browser...")
-    except LoginFailedError as e:
-        path = "login_failed.png"
-        driver.save_screenshot(path)
-        print(f"{e}\nScreenshot saved: {path}")
-        raise
-    except TimeoutException:
-        path = "add_candidate_error.png"
-        driver.save_screenshot(path)
-        print(
-            f"Timed out. Screenshot saved: {path}\n"
-            "If fields moved, inspect the page and update locators in add_candidate_automation.py."
+        proceed = modal_wait.until(
+            EC.element_to_be_clickable((By.XPATH, PROCEED_BUTTON))
         )
-        raise
+        proceed.click()
+        pause_after_major_action()
+    except TimeoutException:
+        pass
+
+    # Confirm we left the login route (dashboard or app home).
+    WebDriverWait(driver, LOGIN_NAV_WAIT).until(
+        lambda d: "/login" not in (d.current_url or "").lower()
+    )
+    pause_after_major_action()
+
+
+# ---------------------------------------------------------------------------
+# Step 3: dashboard ready
+# ---------------------------------------------------------------------------
+def wait_for_dashboard_ready(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
+    """
+    Treat the header “Add Candidate” control as the signal that the shell UI is ready.
+    """
+    wait.until(EC.element_to_be_clickable((By.XPATH, XP_ADD_CANDIDATE_BUTTON)))
+
+
+# ---------------------------------------------------------------------------
+# Step 4–5: open form and wait for fields
+# ---------------------------------------------------------------------------
+def click_add_candidate(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
+    """Click the Add Candidate entry in the header."""
+    btn = wait.until(EC.element_to_be_clickable((By.XPATH, XP_ADD_CANDIDATE_BUTTON)))
+    btn.click()
+    pause_after_major_action()
+
+
+def wait_for_candidate_form(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
+    """Wait until the first-name input for the add flow is present and interactable."""
+    form_wait = WebDriverWait(driver, FORM_WAIT)
+    form_wait.until(EC.visibility_of_element_located((By.XPATH, XP_FIRST_NAME)))
+
+
+# ---------------------------------------------------------------------------
+# Step 6: fill fields
+# ---------------------------------------------------------------------------
+def fill_candidate_form(
+    driver: webdriver.Chrome, wait: WebDriverWait, data: CandidateTestData
+) -> None:
+    """Populate first name, last name, email, and phone from generated test data."""
+    fn = wait.until(EC.element_to_be_clickable((By.XPATH, XP_FIRST_NAME)))
+    fn.clear()
+    fn.send_keys(data.first_name)
+    pause_after_major_action()
+
+    ln = wait.until(EC.element_to_be_clickable((By.XPATH, XP_LAST_NAME)))
+    ln.clear()
+    ln.send_keys(data.last_name)
+    pause_after_major_action()
+
+    em = wait.until(EC.element_to_be_clickable((By.XPATH, XP_EMAIL)))
+    em.clear()
+    em.send_keys(data.email)
+    pause_after_major_action()
+
+    ph = wait.until(EC.element_to_be_clickable((By.XPATH, XP_PHONE)))
+    ph.clear()
+    ph.send_keys(data.phone)
+    pause_after_major_action()
+
+
+# ---------------------------------------------------------------------------
+# Step 7–8: submit and verify
+# ---------------------------------------------------------------------------
+def click_create_candidate(
+    driver: webdriver.Chrome, wait: WebDriverWait
+) -> tuple[WebElement, str]:
+    """
+    Click Create Candidate. Returns (create_button_element, url_before_click) for verification.
+    """
+    create = wait.until(EC.element_to_be_clickable((By.XPATH, XP_CREATE_CANDIDATE)))
+    url_before = driver.current_url or ""
+    create.click()
+    pause_after_major_action()
+    return create, url_before
+
+
+def _visible_success_toast_or_alert(driver: webdriver.Chrome) -> bool:
+    """True if a visible toast/alert/snackbar likely reports a successful save."""
+    for xp in SUCCESS_MESSAGE_CONTAINER_XPATHS:
+        try:
+            for el in driver.find_elements(By.XPATH, xp):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    text = (el.text or "").strip().lower()
+                    if not text:
+                        continue
+                    if any(k in text for k in SUCCESS_TEXT_KEYWORDS):
+                        return True
+                except StaleElementReferenceException:
+                    continue
+        except Exception:
+            continue
+    # Short, specific banner text (avoid matching huge page bodies).
+    try:
+        for el in driver.find_elements(
+            By.XPATH,
+            "//*[self::div or self::span][string-length(normalize-space(.)) < 180]"
+            "[contains(., 'Candidate')]"
+            "[contains(., 'created') or contains(., 'Created')]",
+        ):
+            if el.is_displayed():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _candidate_save_signals(
+    driver: webdriver.Chrome,
+    first_name_el,
+    create_button_el,
+    url_before: str,
+) -> bool:
+    """Return True if any heuristic indicates the candidate was created."""
+    # DOM replaced (navigation or full re-render)
+    try:
+        first_name_el.is_displayed()
+    except StaleElementReferenceException:
+        return True
+
+    if create_button_el is not None:
+        try:
+            create_button_el.is_displayed()
+        except StaleElementReferenceException:
+            return True
+
+    # Same node kept but form reset to empty
+    try:
+        if not (first_name_el.get_attribute("value") or "").strip():
+            return True
+    except StaleElementReferenceException:
+        return True
+
+    cur = driver.current_url or ""
+    low = cur.lower()
+    prev_low = (url_before or "").lower()
+
+    if cur and cur != url_before and "/login" not in low:
+        return True
+
+    # Started on an “add” screen and the app navigated away from that route after save.
+    if (
+        ("/prospect/add" in prev_low or "/candidates/add" in prev_low)
+        and "/prospect/add" not in low
+        and "/candidates/add" not in low
+        and "/login" not in low
+    ):
+        return True
+
+    if _visible_success_toast_or_alert(driver):
+        return True
+
+    return False
+
+
+def verify_candidate_created(
+    driver: webdriver.Chrome,
+    first_name_element,
+    create_button_element,
+    url_before: str,
+) -> bool:
+    """
+    Poll until POST_CREATE_WAIT for staleness, cleared first name, URL change,
+    or a success-style toast/message.
+    """
+    try:
+        WebDriverWait(driver, POST_CREATE_WAIT).until(
+            lambda d: _candidate_save_signals(
+                d, first_name_element, create_button_element, url_before
+            )
+        )
+        return True
+    except TimeoutException:
+        return False
+
+
+def run() -> int:
+    driver = None
+    try:
+        driver = build_driver()
+        wait = build_wait(driver)
+
+        # Step 1–2: Login page + credentials
+        navigate_to_login(driver, wait)
+        perform_login(driver, wait)
+
+        # Step 3: Dashboard / app chrome loaded
+        dash_wait = WebDriverWait(driver, DASHBOARD_WAIT)
+        wait_for_dashboard_ready(driver, dash_wait)
+
+        # Step 4–5: Add candidate + form visible
+        click_add_candidate(driver, dash_wait)
+        wait_for_candidate_form(driver, build_wait(driver, FORM_WAIT))
+
+        # Unique candidate row for this run (email / phone / names never reused as-is).
+        use_random_names = getattr(_local, "ADD_CANDIDATE_USE_RANDOM_NAME_POOL", False)
+        candidate = generate_unique_candidate_data(
+            use_random_name_from_pool=use_random_names,
+        )
+        print(
+            "Generated candidate:",
+            f"{candidate.first_name} {candidate.last_name} | {candidate.email} | {candidate.phone}",
+        )
+
+        # Step 6: Fill fields (keep reference to first name for verification)
+        fill_candidate_form(driver, build_wait(driver, FORM_WAIT), candidate)
+        first_el = driver.find_element(By.XPATH, XP_FIRST_NAME)
+
+        # Step 7: Submit (keep button ref + URL for verification)
+        create_el, url_before_create = click_create_candidate(
+            driver, build_wait(driver, FORM_WAIT)
+        )
+
+        # Step 8: Verify when possible
+        if verify_candidate_created(driver, first_el, create_el, url_before_create):
+            print("Verification: form cleared or navigated after create (success signal).")
+        else:
+            print(
+                "Verification: no success signal within the wait window. "
+                "Check the UI, network, or extend SUCCESS_MESSAGE_CONTAINER_XPATHS / "
+                "_candidate_save_signals() in add_candidate_automation.py.",
+                file=sys.stderr,
+            )
+
+        return 0
+
+    except TimeoutException as e:
+        print(f"Timed out waiting for an element or page state: {e}", file=sys.stderr)
+        try:
+            driver.save_screenshot("add_candidate_automation_error.png")
+            print("Screenshot: add_candidate_automation_error.png", file=sys.stderr)
+        except WebDriverException:
+            pass
+        return 1
+    except WebDriverException as e:
+        print(f"WebDriver error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        try:
+            driver.save_screenshot("add_candidate_automation_error.png")
+        except WebDriverException:
+            pass
+        return 1
     finally:
-        driver.quit()
-        print("Browser closed.")
+        # Step 9: Always close the browser when it was started
+        if driver is not None:
+            try:
+                driver.quit()
+            except WebDriverException:
+                pass
+            print("Browser closed.")
 
 
 if __name__ == "__main__":
-    main()
-#comment
+    raise SystemExit(run())
