@@ -10,7 +10,8 @@ LOGIN_URL = "http://localhost:5000/login"
 EMAIL = "your-email@example.com"
 PASSWORD = "your-password"
 
-# Add_candidate.py — example candidate fields
+# add_candidate_automation.py — optional name seeds (each run still adds a unique suffix).
+# Optional: ADD_CANDIDATE_USE_RANDOM_NAME_POOL = True  # random first/last from built-in pools
 CANDIDATE_FIRST_NAME = "Test"
 CANDIDATE_LAST_NAME = "Candidate"
 CANDIDATE_EMAIL = "test.candidate@example.com"
